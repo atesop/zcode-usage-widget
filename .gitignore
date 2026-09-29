@@ -1,0 +1,10 @@
+# Python 编译产物
+__pycache__/
+*.py[cod]
+
+# 本地虚拟环境
+.venv/
+venv/
+
+# 运行日志（如有）
+log/
