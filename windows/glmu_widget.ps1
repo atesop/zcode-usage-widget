@@ -4,19 +4,32 @@
 # 路径:   查询命令默认从脚本自身位置（\\wsl.localhost\<发行版>\...\windows）
 #          自动推导仓库根下的 glm_usage_all.py，无需硬编码绝对路径；
 #          也可用 -WslCommand 显式指定完整命令覆盖推导结果
-# 行为: 启动自动查询一次 + 手动刷新按钮；置顶、无边框、可拖动、记忆位置
+# 行为: 启动即查询 + 每分钟自动刷新（-AutoRefreshSec 可调，0 关闭）；
+#       状态栏以身份色 chip 展示各订阅 5 小时窗口已用百分比（简写 01-w/02-z/03-a）；
+#       置顶、无边框、可拖动、记忆位置；可停靠屏幕四角（-Dock，拖动即解除）
 # 注意: 本文件必须保存为 UTF-8 with BOM（PowerShell 5.1 才能正确读中文）
 # =====================================================================
 #requires -Version 5.1
 param(
     [string]$WslCommand = "",
     [int]$QueryTimeoutMs = 25000,
-    [string]$PosFile = "$env:LOCALAPPDATA\glmu_widget.json"
+    [int]$AutoRefreshSec = 60,
+    [string]$PosFile = "$env:LOCALAPPDATA\glmu_widget.json",
+    # 停靠角落：BottomLeft/BottomRight/TopLeft/TopRight；None 解除停靠；空 = 沿用记忆值
+    [string]$Dock = ""
 )
 
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName System.Windows.Forms
+
+# -Dock 取值校验（早失败，避免带着非法值跑到定位阶段）
+if (@("", "None", "BottomLeft", "BottomRight", "TopLeft", "TopRight") -notcontains $Dock) {
+    [System.Windows.MessageBox]::Show(
+        "-Dock 取值必须是 BottomLeft / BottomRight / TopLeft / TopRight / None，当前: $Dock",
+        "glmu-widget") | Out-Null
+    exit 1
+}
 
 # ---- 推导 WSL 查询命令：从脚本自身 UNC 位置定位仓库根，不依赖硬编码路径 ----
 # $PSScriptRoot 形如 \\wsl.localhost\<发行版>\home\<用户>\...\zcode\windows
@@ -26,7 +39,11 @@ if (-not $WslCommand) {
     if ($repoRoot -and $repoRoot -match '^\\\\wsl(?:\.localhost|\$)\\([^\\]+)\\(.+)$') {
         $distro  = $Matches[1]
         $wslPath = '/' + ($Matches[2] -replace '\\', '/')
-        $WslCommand = "-d `"$distro`" python3 `"$wslPath/glm_usage_all.py`" --json"
+        # 注意：-d 的值不能加引号——旧版 wsl.exe（≤2.4.x，如本机 2.4.13）会把引号当成
+        # 发行版名的一部分，找名为 "Ubuntu-22.04"（带引号）的发行版并报
+        # WSL_E_DISTRO_NOT_FOUND；错误文本还会以 UTF-16LE 混入 stdout，导致 JSON 解析报
+        # "无效的 JSON 基元"。尾部 python3 后的路径引号是传给 WSL 内 shell 消费的，可保留。
+        $WslCommand = "-d $distro python3 `"$wslPath/glm_usage_all.py`" --json"
     } else {
         [System.Windows.MessageBox]::Show(
             "无法从脚本位置推导 WSL 仓库路径（$repoRoot）。`n`n请把本脚本放在 WSL 文件系统内仓库的 windows 目录下运行，`n或用 -WslCommand 显式指定，例如：`npython3 /home/<用户>/zcode/glm_usage_all.py --json",
@@ -135,11 +152,17 @@ $script:queryScript = {
             try { $p.Kill() } catch {}
             throw "查询超时（WSL 冷启动或网络异常）"
         }
-        if ($out.Trim()) {
-            $sync.Data = $out | ConvertFrom-Json
-        } else {
+        if (-not $out.Trim()) {
             throw ("WSL 调用失败: " + $err.Trim())
         }
+        if ($out.TrimStart() -notmatch '^\{') {
+            # wsl.exe 自身报错（找不到发行版、升级卡住等）会把 UTF-16LE 错误文本写进
+            # stdout；此时不让 JSON 解析器报"无效的基元"，直接透出输出开头便于定位
+            $head = $out.Trim() -replace '[\r\n]+', ' '
+            if ($head.Length -gt 120) { $head = $head.Substring(0, 120) }
+            throw ("wsl.exe 输出非 JSON（wsl 层错误）: " + $head)
+        }
+        $sync.Data = $out | ConvertFrom-Json
     } catch {
         $sync.Error = $_.Exception.Message
     } finally {
@@ -261,8 +284,86 @@ function Update-Content($data) {
 }
 
 function Set-Status([string]$text, [string]$color) {
-    $script:statusText.Text = $text
-    $script:statusText.Foreground = Get-Brush $color
+    # 纯文本状态（启动中/查询中/查询失败）：清空摘要 chip 后放单个 TextBlock
+    $script:statusHost.Children.Clear()
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $text
+    $tb.FontSize = 10.5
+    $tb.Foreground = Get-Brush $color
+    $tb.VerticalAlignment = "Center"
+    $script:statusHost.Children.Add($tb) | Out-Null
+    $script:statusHost.ToolTip = $null
+}
+
+function Get-ShortLabel([string]$name) {
+    # 状态栏简写："01-wanghao-glm-flash-bigmodel" -> "01-w"（序号 + 紧随其后的首字母）
+    if ($name -match '^(\d{1,2})[-_ ]*([A-Za-z])') { return ($Matches[1] + "-" + $Matches[2]) }
+    return $name
+}
+
+function New-QuotaChip([string]$accent) {
+    # 单个订阅的状态 chip：身份色圆角药丸（底色 25% / 描边 40% 透明度），内容上下两行
+    $chip = New-Object System.Windows.Controls.Border
+    $chip.CornerRadius = "8"
+    $chip.Background = Get-Brush ("#3D" + $accent.Substring(1))
+    $chip.BorderBrush = Get-Brush ("#66" + $accent.Substring(1))
+    $chip.BorderThickness = "1"
+    $chip.Padding = "6,2,6,2"
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $top = New-Object System.Windows.Controls.TextBlock      # 上行：简写
+    $top.FontSize = 10
+    $top.HorizontalAlignment = "Center"
+    $bot = New-Object System.Windows.Controls.TextBlock      # 下行：百分比
+    $bot.FontSize = 10.5
+    $bot.HorizontalAlignment = "Center"
+    $sp.Children.Add($top) | Out-Null
+    $sp.Children.Add($bot) | Out-Null
+    $chip.Child = $sp
+    return $chip
+}
+
+function Set-QuotaStatus($data) {
+    # 状态栏摘要：每个订阅一枚身份色 chip，上下两行——上行简写 / 下行 N 小时窗口已用%
+    # chip 底色/描边与展开卡片同色系（按订阅名哈希，增删 profile 不串色）；
+    # 简写统一蓝色（COLOR_ACCENT）、百分比按已用阈值绿/黄/红着色；无该维度收起下行；失败下行标 ✗；
+    # 更新时间/剩余/重置点放悬停 ToolTip（整体 + 单 chip 各一份）
+    $all = @($data.results)
+    $okN = @($all | Where-Object { $_.ok }).Count
+    $tip = @("更新于 " + $data.queried_at + " · " + $okN + "/" + $all.Count)
+
+    $script:statusHost.Children.Clear()
+    $first = $true
+    foreach ($res in $all) {
+        $label = Get-ShortLabel $res.name
+        $accent = Get-AccentFor $res.name
+        $chip = New-QuotaChip $accent
+        if (-not $first) { $chip.Margin = "5,0,0,0" }
+        $first = $false
+        $lines = $chip.Child.Children
+
+        $lines[0].Text = $label
+        $lines[0].Foreground = Get-Brush $script:COLOR_ACCENT
+
+        $win = @($res.rows) | Where-Object { $_.name -match '小时窗口' } | Select-Object -First 1
+        if (-not $res.ok) {
+            $lines[1].Text = "✗"
+            $lines[1].Foreground = Get-Brush $script:COLOR_RED
+            $line = ($label + " 查询失败: " + $res.error)
+        } elseif ($win) {
+            $pct = 0.0
+            if ($win.pct) { $pct = [double]$win.pct }
+            $lines[1].Text = ("{0}%" -f [int]$pct)
+            $lines[1].Foreground = Get-Brush (Get-PctColor $pct)
+            $line = ($label + " " + $win.name + " 已用 " + [int]$pct + "% · " + $win.extra + " · 重置 " + (Format-Reset $win.reset))
+        } else {
+            $lines[1].Visibility = "Collapsed"
+            $line = ($label + "（" + $res.level + "）无小时窗口维度")
+        }
+        $chip.ToolTip = $line
+        $tip += $line
+        $script:statusHost.Children.Add($chip) | Out-Null
+    }
+    $script:statusHost.ToolTip = ($tip -join "`n")
 }
 
 $script:collapsed = $false
@@ -272,6 +373,8 @@ function Set-Collapsed([bool]$on) {
     # 折叠/展开：折叠时只留标题药丸；状态随改随存
     $script:collapsed = $on
     $script:contentPanel.Visibility = if ($on) { "Collapsed" } else { "Visible" }
+    # 高度变化后重贴角（推迟到布局完成后；不依赖 SizeChanged——该场景偶发不触发，底边会悬空）
+    Request-Redock
     Save-Pos
 }
 
@@ -291,8 +394,10 @@ $xaml = @'
                    FontSize="14" VerticalAlignment="Center"/>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
                     VerticalAlignment="Center" Background="Transparent">
-          <TextBlock x:Name="StatusText" Foreground="#9399B2" FontSize="10.5"
-                     VerticalAlignment="Center" Margin="0,0,8,0" Text="启动中…"/>
+          <StackPanel x:Name="StatusHost" Orientation="Horizontal" Margin="0,0,8,0">
+            <TextBlock Text="启动中…" Foreground="#9399B2" FontSize="10.5"
+                       VerticalAlignment="Center"/>
+          </StackPanel>
           <Button x:Name="BtnClose" Content="×" Width="24" Height="22"
                   Background="Transparent" Foreground="#9399B2"
                   BorderThickness="0" FontSize="14" Cursor="Hand"/>
@@ -306,12 +411,13 @@ $xaml = @'
 
 $win = [System.Windows.Markup.XamlReader]::Parse($xaml)
 $script:contentPanel = $win.FindName("ContentPanel")
-$script:statusText = $win.FindName("StatusText")
+$script:statusHost = $win.FindName("StatusHost")
 $titleGrid = $win.FindName("TitleGrid")
 $btnClose = $win.FindName("BtnClose")
 
 # ---- 位置：优先读记忆文件，否则默认停靠屏幕右上角 ----
 $placed = $false
+$dockSaved = ""
 if (Test-Path $PosFile) {
     try {
         $pos = Get-Content $PosFile -Raw | ConvertFrom-Json
@@ -319,6 +425,7 @@ if (Test-Path $PosFile) {
         $win.Top = [double]$pos.y
         $placed = $true
         if ($pos.collapsed) { $script:restoredCollapsed = $true }
+        if ($pos.dock) { $dockSaved = [string]$pos.dock }
     } catch {}
 }
 if (-not $placed) {
@@ -328,6 +435,94 @@ if (-not $placed) {
     $win.Left = $wa.Right - $win.Width - 16
     $win.Top = $wa.Top + 16
 }
+
+# 停靠模式解析：命令行显式 -Dock > 记忆值 > 自由悬浮（None）
+$script:dock = if ($Dock) { $Dock } elseif ($dockSaved) { $dockSaved } else { "None" }
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class GlmuMon {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public uint Flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string Dev; }
+  [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT p, uint flags);
+  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr h, ref MONITORINFO i);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+}
+'@
+
+function Invoke-Redock {
+    # 停靠态按当前窗口尺寸重贴角（工作区角落留 8 物理像素边距）。
+    # 窗口显示后走物理像素路径：GetWindowRect/GetMonitorInfo/SetWindowPos 同一坐标系，
+    # 规避 WPF 每显示器 DPI（副屏缩放非 100% 时）DIP 换算与实际渲染不一致的偏差；
+    # 窗口未显示时按记忆位置粗贴（系统 DPI 估算），显示后由 Loaded/SizeChanged 精贴。
+    # 多显示器下选"窗口当前所在"那块屏（启动即停靠时窗口停在记忆位置 → 即用户常用屏）
+    if ($script:dock -eq "None") { return $false }
+    $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($win)).Handle
+    if ($hwnd -eq [IntPtr]::Zero) {
+        # 未显示：窗口中心换算物理像素选屏，按 200 DIP 估算高度粗贴（仅求首帧就近）
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+            $scale = $g.DpiX / 96.0
+            $g.Dispose()
+            if ($scale -le 0) { $scale = 1.0 }
+            $pt = New-Object GlmuMon+POINT
+            $pt.X = [int](($win.Left + $win.Width / 2) * $scale)
+            $pt.Y = [int](($win.Top + 100) * $scale)
+            $mi = New-Object GlmuMon+MONITORINFO
+            $mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][GlmuMon+MONITORINFO])
+            if (-not [GlmuMon]::GetMonitorInfo([GlmuMon]::MonitorFromPoint($pt, 2), [ref]$mi)) { return $false }
+            $x = 0; $y = 0
+            $wPx = [int]($win.Width * $scale); $hPx = [int](200 * $scale)
+            switch ($script:dock) {
+                "BottomLeft"  { $x = $mi.rcWork.L + 8;           $y = $mi.rcWork.B - $hPx - 8 }
+                "BottomRight" { $x = $mi.rcWork.R - $wPx - 8;    $y = $mi.rcWork.B - $hPx - 8 }
+                "TopLeft"     { $x = $mi.rcWork.L + 8;           $y = $mi.rcWork.T + 8 }
+                "TopRight"    { $x = $mi.rcWork.R - $wPx - 8;    $y = $mi.rcWork.T + 8 }
+            }
+            $win.Left = $x / $scale
+            $win.Top = $y / $scale
+            return $true
+        } catch { return $false }
+    }
+    $wr = New-Object GlmuMon+RECT
+    if (-not [GlmuMon]::GetWindowRect($hwnd, [ref]$wr)) { return $false }
+    $mi = New-Object GlmuMon+MONITORINFO
+    $mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][GlmuMon+MONITORINFO])
+    if (-not [GlmuMon]::GetMonitorInfo([GlmuMon]::MonitorFromWindow($hwnd, 2), [ref]$mi)) { return $false }
+    $wPx = $wr.R - $wr.L; $hPx = $wr.B - $wr.T
+    $x = 0; $y = 0
+    switch ($script:dock) {
+        "BottomLeft"  { $x = $mi.rcWork.L + 8;          $y = $mi.rcWork.B - $hPx - 8 }
+        "BottomRight" { $x = $mi.rcWork.R - $wPx - 8;   $y = $mi.rcWork.B - $hPx - 8 }
+        "TopLeft"     { $x = $mi.rcWork.L + 8;          $y = $mi.rcWork.T + 8 }
+        "TopRight"    { $x = $mi.rcWork.R - $wPx - 8;   $y = $mi.rcWork.T + 8 }
+    }
+    # SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE：只挪位置，不抢焦点（防停靠瞬移打断用户输入）
+    [void][GlmuMon]::SetWindowPos($hwnd, [IntPtr]::Zero, $x, $y, 0, 0, 0x0015)
+    return $true
+}
+
+function Request-Redock {
+    # 高度即将变化（内容重建/折叠切换）后请求重贴角：ContextIdle 优先级在本轮布局渲染之后
+    # 执行，保证读到最终窗口高度；比依赖 SizeChanged 可靠（后者在该场景偶发不触发）
+    $win.Dispatcher.BeginInvoke(
+        [action]{ if ($script:dock -and $script:dock -ne "None") { Invoke-Redock } },
+        [System.Windows.Threading.DispatcherPriority]::ContextIdle) | Out-Null
+}
+# 启动先按记忆位置所在屏贴一次（此刻窗口未显示、高度为估算），
+# Loaded/SizeChanged 后用精确设备变换再校正
+Invoke-Redock | Out-Null
+
+$win.Add_Loaded({ if ($script:dock -ne "None") { Invoke-Redock | Out-Null } })
+
+# 高度变化（首次布局/折叠展开/每轮刷新内容）自动重贴角，保证停靠的底边/顶边钉死不留缝
+$win.Add_SizeChanged({ if ($script:dock -ne "None") { Invoke-Redock | Out-Null } })
 
 function Reset-IfOffscreen {
     # 显示器拓扑/缩放变化后窗口可能漂出可见区域：落在虚拟桌面外较多时召回工作区右上角
@@ -341,6 +536,8 @@ function Reset-IfOffscreen {
     $vsB = $vsT + [System.Windows.SystemParameters]::VirtualScreenHeight
     $inside = (($x + $w) -gt ($vsL + 60)) -and ($x -lt ($vsR - 60)) -and (($y + $h) -gt ($vsT + 40)) -and ($y -lt ($vsB - 40))
     if (-not $inside) {
+        # 停靠态优先重贴角（等效召回）；自由态才回工作区右上角
+        if (Invoke-Redock) { return }
         $wa = [System.Windows.SystemParameters]::WorkArea
         $win.Left = $wa.Right - $win.Width - 16
         $win.Top = $wa.Top + 16
@@ -348,16 +545,17 @@ function Reset-IfOffscreen {
 }
 Reset-IfOffscreen
 
-# 显示器拓扑变化（插拔/切换主屏）时自动召回窗口；SystemEvents 回调在非 UI 线程，需 Dispatcher 转发
+# 显示器拓扑变化（插拔/切换主屏）时：停靠态重贴角，自由态召回工作区右上角；
+# SystemEvents 回调在非 UI 线程，需 Dispatcher 转发
 $script:displayChangedHandler = {
-    $win.Dispatcher.Invoke([action]{ Reset-IfOffscreen })
+    $win.Dispatcher.Invoke([action]{ if (-not (Invoke-Redock)) { Reset-IfOffscreen } })
 }
 [Microsoft.Win32.SystemEvents]::add_DisplaySettingsChanged($script:displayChangedHandler)
 
 function Save-Pos {
     # 关闭/退出时记忆窗口位置与折叠状态
     try {
-        @{ x = $win.Left; y = $win.Top; collapsed = $script:collapsed } |
+        @{ x = $win.Left; y = $win.Top; collapsed = $script:collapsed; dock = $script:dock } |
             ConvertTo-Json | Set-Content -Path $PosFile -Encoding UTF8
     } catch {}
 }
@@ -387,9 +585,9 @@ $script:timer.Add_Tick({
             Set-Status ("查询失败: " + $script:sync.Error) $script:COLOR_RED
         } elseif ($script:sync.Data) {
             Update-Content $script:sync.Data
-            $all = @($script:sync.Data.results)
-            $okN = @($all | Where-Object { $_.ok }).Count
-            Set-Status ("更新于 " + $script:sync.Data.queried_at + " · " + $okN + "/" + $all.Count) $script:COLOR_DIM
+            Set-QuotaStatus $script:sync.Data
+            # 内容重建后高度变化，布局完成后重贴角（SizeChanged 在此场景偶发不触发，不单独依赖它）
+            Request-Redock
         } else {
             Set-Status "查询失败: 空响应" $script:COLOR_RED
         }
@@ -399,9 +597,18 @@ $script:timer.Add_Tick({
     }
 })
 
+# ---- 自动刷新：默认每 60 秒静默补一查 ----
+# 不闪"查询中…"（状态栏摘要原地更新）；上一轮查询尚未回收则跳过本轮，避免叠查询
+if ($AutoRefreshSec -gt 0) {
+    $script:autoTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:autoTimer.Interval = [TimeSpan]::FromSeconds($AutoRefreshSec)
+    $script:autoTimer.Add_Tick({ if (-not $script:handle) { Start-Query } })
+    $script:autoTimer.Start()
+}
+
 # ---- 事件绑定 ----
 # 标题栏：按住拖动（位移>3 DIP 判定为拖）；松开未移动视为点击
-#   折叠状态点击 = 展开并刷新；展开状态点击 = 手动刷新
+#   折叠状态点击 = 展开并刷新；展开状态点击 = 手动刷新；停靠状态拖动 = 解除停靠
 $script:grabOffset = $null
 $script:titleMoved = $false
 
@@ -417,6 +624,8 @@ $titleGrid.Add_MouseMove({
         $dy = $rel.Y - $script:grabOffset.Y
         if (([Math]::Abs($dx) + [Math]::Abs($dy)) -gt 3) { $script:titleMoved = $true }
         if ($script:titleMoved) {
+            # 停靠态下拖动即解除停靠（窗口跟手走，停靠选择随之解除记忆）
+            if ($script:dock -ne "None") { $script:dock = "None" }
             $win.Left += $dx
             $win.Top += $dy
         }
