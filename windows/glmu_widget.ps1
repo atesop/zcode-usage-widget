@@ -373,6 +373,10 @@ function Set-Collapsed([bool]$on) {
     # 折叠/展开：折叠时只留标题药丸；状态随改随存
     $script:collapsed = $on
     $script:contentPanel.Visibility = if ($on) { "Collapsed" } else { "Visible" }
+    # SizeToContent 偶发不再重估（窗口冻结在旧高度，2026-10-28 实证）：
+    # 重装一遍 Manual→Height 强制重新量高
+    $win.SizeToContent = "Manual"
+    $win.SizeToContent = "Height"
     # 高度变化后重贴角（推迟到布局完成后；不依赖 SizeChanged——该场景偶发不触发，底边会悬空）
     Request-Redock
     Save-Pos
@@ -436,8 +440,10 @@ if (-not $placed) {
     $win.Top = $wa.Top + 16
 }
 
-# 停靠模式解析：命令行显式 -Dock > 记忆值 > 自由悬浮（None）
-$script:dock = if ($Dock) { $Dock } elseif ($dockSaved) { $dockSaved } else { "None" }
+# 停靠模式解析：角落停靠暂缓（2026-10-28 老大决定，该功能待修）——
+# 强制 None 使全部停靠路径短路，行为等同停靠功能上线前的版本；修复后还原下面注释行即可
+# $script:dock = if ($Dock) { $Dock } elseif ($dockSaved) { $dockSaved } else { "None" }
+$script:dock = "None"
 
 Add-Type -TypeDefinition @'
 using System;
